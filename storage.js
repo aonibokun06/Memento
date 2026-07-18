@@ -22,6 +22,7 @@ const LOCAL_ONLY_FIELDS = ["sourceUrl"];
  * @property {string}  createdAt      ISO
  * @property {string}  title
  * @property {string}  platform       "chatgpt.com" | "claude.ai"
+ * @property {string}  profile        "general" | "engineering"
  * @property {string}  sourceUrl      LOCAL ONLY — identifies the owner's chat
  * @property {number}  messageCount
  * @property {object}  state          the extracted checkpoint itself
@@ -60,7 +61,7 @@ export async function getCheckpoint(id) {
 }
 
 /**
- * @param {{title, platform, sourceUrl, messageCount, state, verification?}} input
+ * @param {{title, platform, profile, sourceUrl, messageCount, state, verification?}} input
  * @returns {Promise<Checkpoint>}
  */
 export async function saveCheckpoint(input) {
@@ -162,6 +163,28 @@ export function formatRestorePrompt(cp) {
     }
   }
 
+  if (cp.profile === "engineering" && s.engineeringState) {
+    const e = s.engineeringState;
+    const engineering = [];
+    if (e.branch) engineering.push(`Current branch: ${e.branch}`);
+    const add = (label, items) => {
+      if (items?.length) engineering.push(`${label}:\n${items.map((x) => `- ${x}`).join("\n")}`);
+    };
+    add("Completed", e.completed);
+    add("In progress", e.inProgress);
+    add("Blocked", e.blocked);
+    add("Known issues", e.knownIssues);
+    add("Next actions", e.nextActions);
+    add("Definition of done", e.definitionOfDone);
+    if (e.files?.length) engineering.push(
+      `Files:\n${e.files.map((f) => `- ${f.path} — ${f.status}: ${f.purpose}`).join("\n")}`
+    );
+    if (e.commands?.length) engineering.push(
+      `Commands:\n${e.commands.map((c) => `- ${c.command} — ${c.result || "result unknown"}`).join("\n")}`
+    );
+    if (engineering.length) out.push("", "## Engineering handoff", engineering.join("\n\n"));
+  }
+
   if (s.resumptionPoint) {
     out.push("", "## Where we left off", s.resumptionPoint);
   }
@@ -184,19 +207,60 @@ export function formatRestorePrompt(cp) {
 // "what goes out" decision already has exactly one home.
 
 /** Strip local-only fields. ALWAYS route outbound checkpoints through this. */
-export function toShareable(checkpoint) {
-  const copy = { ...checkpoint };
+export function toShareable(checkpoint, mode = "full") {
+  const copy = JSON.parse(JSON.stringify(checkpoint));
   for (const field of LOCAL_ONLY_FIELDS) delete copy[field];
+  delete copy.health;
+  delete copy.healthScore;
+  copy.sharing = {
+    exportedAt: new Date().toISOString(),
+    mode,
+    format: "memento-checkpoint",
+  };
+  if (mode === "compact") {
+    copy.verification = null;
+    delete copy.recentMessages;
+  }
   return copy;
 }
 
 /** Accept a checkpoint from elsewhere. Re-IDs it so imports never collide. */
 export async function importCheckpoint(incoming) {
+  if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+    throw new Error("This file does not contain a checkpoint object.");
+  }
   if (incoming?.schemaVersion !== SCHEMA_VERSION) {
     throw new Error(
       `Unsupported checkpoint version: ${incoming?.schemaVersion}`
     );
   }
-  const { id: _discard, ...rest } = incoming;
-  return saveCheckpoint({ ...rest, importedAt: new Date().toISOString() });
+  if (typeof incoming.title !== "string" || !incoming.title.trim()) {
+    throw new Error("The checkpoint is missing a title.");
+  }
+  if (!["chatgpt.com", "claude.ai"].includes(incoming.platform)) {
+    throw new Error(`Unsupported checkpoint platform: ${incoming.platform}`);
+  }
+  if (!incoming.state || typeof incoming.state !== "object" || !incoming.state.goal) {
+    throw new Error("The checkpoint is missing resumable state or a goal.");
+  }
+  for (const field of [
+    "decisions", "findings", "constraints", "openQuestions", "artifacts", "glossary",
+  ]) {
+    if (!Array.isArray(incoming.state[field])) {
+      throw new Error(`Invalid checkpoint state: ${field} must be an array.`);
+    }
+  }
+
+  const {
+    id: _discardId,
+    sourceUrl: _discardUrl,
+    health: _discardHealth,
+    healthScore: _discardScore,
+    ...rest
+  } = incoming;
+  return saveCheckpoint({
+    ...rest,
+    profile: rest.profile === "engineering" ? "engineering" : "general",
+    importedAt: new Date().toISOString(),
+  });
 }

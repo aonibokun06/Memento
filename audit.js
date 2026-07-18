@@ -91,12 +91,12 @@ function checkpointText(state) {
  * Run all local checks.
  * @returns {{status, passed, warnings, blockers, checks: {level,title,detail}[]}}
  */
-export function runHealthChecks(messages, state, verification) {
+export function runHealthChecks(messages, state, verification, savedArtifactAudit) {
   const checks = [];
   const artifacts = state?.artifacts ?? [];
 
   // 1. Artifacts reproduced faithfully?
-  const audit = auditArtifacts(messages, state ?? {});
+  const audit = savedArtifactAudit ?? auditArtifacts(messages, state ?? {});
   const altered = audit.filter((r) => r.status === "altered");
   if (artifacts.length === 0) {
     checks.push({

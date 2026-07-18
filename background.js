@@ -2,6 +2,7 @@
 // calls, and the only place the API key is ever read.
 
 import { getSettings } from "./storage.js";
+import { resolveProfile } from "./profiles.js";
 
 chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
@@ -213,27 +214,33 @@ async function callOpenAI(key, body) {
   }
 }
 
-async function extract(messages) {
+async function extract(messages, profileId = "general") {
   const { openaiKey } = await getSettings();
   if (!openaiKey) {
     return { ok: false, error: "No OpenAI key set. Add one in Settings." };
   }
 
   const transcript = formatTranscript(messages);
+  const profile = resolveProfile(profileId, {
+    extractModel: EXTRACT_MODEL,
+    verifyModel: VERIFY_MODEL,
+    systemPrompt: SYSTEM_PROMPT,
+    schema: CHECKPOINT_SCHEMA,
+  });
   if (transcript.length > MAX_TRANSCRIPT_CHARS) {
     return {
       ok: false,
       error:
         `Conversation is ~${Math.round(transcript.length / 4000)}k tokens, past ` +
-        `what ${EXTRACT_MODEL} can hold. Checkpoint the first half separately, ` +
+        `what ${profile.extractModel} can hold. Checkpoint the first half separately, ` +
         `or switch to a larger-context model in background.js.`,
     };
   }
 
   const res = await callOpenAI(openaiKey, {
-    model: EXTRACT_MODEL,
+    model: profile.extractModel,
     messages: [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: profile.systemPrompt },
       {
         role: "user",
         content: `Extract resumable state from this conversation:\n\n${transcript}`,
@@ -244,7 +251,7 @@ async function extract(messages) {
       json_schema: {
         name: "checkpoint",
         strict: true,
-        schema: CHECKPOINT_SCHEMA,
+        schema: profile.schema,
       },
     },
   });
@@ -311,14 +318,20 @@ Report three kinds of problem:
 
 Judge by what's load-bearing for resuming, not by completeness. Dropped pleasantries, abandoned tangents, and restatements are correct compression, not omissions — do not report them. An empty findings array is the right answer for a good checkpoint; do not invent problems to look useful.`;
 
-async function verify(messages, state) {
+async function verify(messages, state, profileId = "general") {
   const { openaiKey } = await getSettings();
   if (!openaiKey) {
     return { ok: false, error: "No OpenAI key set. Add one in Settings." };
   }
 
+  const profile = resolveProfile(profileId, {
+    extractModel: EXTRACT_MODEL,
+    verifyModel: VERIFY_MODEL,
+    systemPrompt: SYSTEM_PROMPT,
+    schema: CHECKPOINT_SCHEMA,
+  });
   const body = {
-    model: VERIFY_MODEL,
+    model: profile.verifyModel,
     messages: [
       { role: "system", content: VERIFY_PROMPT },
       {
@@ -345,8 +358,8 @@ async function verify(messages, state) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const handlers = {
-    EXTRACT: () => extract(msg.messages),
-    VERIFY: () => verify(msg.messages, msg.state),
+    EXTRACT: () => extract(msg.messages, msg.profile),
+    VERIFY: () => verify(msg.messages, msg.state, msg.profile),
   };
   const handler = handlers[msg.type];
   if (!handler) return;
