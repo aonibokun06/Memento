@@ -7,10 +7,12 @@ import {
   saveSettings,
   formatRestorePrompt,
   setPendingRestore,
+  selectTail,
   toShareable,
   importCheckpoint,
 } from "./storage.js";
-import { analyzeCheckpointHealth } from "./health.js";
+import { auditArtifacts, runHealthChecks } from "./audit.js";
+import { PROFILE_OPTIONS } from "./profiles.js";
 
 const statusEl = document.getElementById("status");
 const viewEl = document.getElementById("view");
@@ -18,6 +20,8 @@ const viewEl = document.getElementById("view");
 let currentView = "checkpoints";
 let scraped = null; // last scan result, held in memory only
 let extracted = null; // last extraction result, held in memory only
+let verification = null; // independent model's audit of `extracted`
+let artifactAudit = null; // deterministic verbatim check, no model involved
 let captureProfile = "general";
 let selectedId = null; // checkpoint open in the detail view
 
@@ -116,63 +120,75 @@ async function renderDetail() {
   const exportCompact = el("button", { textContent: "Export compact" });
   exportCompact.addEventListener("click", () => doExport(cp, "compact"));
 
-  for (const b of [restore, copy, exportFull, exportCompact, del]) b.style.marginRight = "6px";
   viewEl.append(
     back,
-    el("div", { className: "detail-actions" }, restore, copy, exportFull, exportCompact, del)
+    el("div", { className: "actions" }, restore, copy, exportFull, exportCompact, del),
+    el("div", {
+      className: "profile-badge",
+      textContent: cp.profile === "engineering" ? "Engineering profile" : "Business / General profile",
+    })
   );
-  viewEl.append(el("div", {
-    className: "profile-badge",
-    textContent: cp.profile === "engineering" ? "Engineering profile" : "Business / General profile",
-  }));
-  viewEl.append(renderHealth(cp));
-  if (cp.state) viewEl.append(renderState(cp.state, cp.profile));
+  if (cp.state) {
+    viewEl.append(renderHealth(runHealthChecks(
+      cp.recentMessages ?? [], cp.state, cp.verification, cp.artifactAudit
+    )));
+    viewEl.append(renderState(cp.state, cp.profile));
+  }
 }
 
 async function renderCapture() {
   viewEl.replaceChildren();
 
   const profile = el("select");
-  profile.append(
-    el("option", { value: "general", textContent: "Business / General" }),
-    el("option", { value: "engineering", textContent: "Engineering / SWE" })
-  );
+  for (const option of PROFILE_OPTIONS) {
+    profile.append(el("option", { value: option.id, textContent: option.label }));
+  }
   profile.value = captureProfile;
   profile.addEventListener("change", () => {
     captureProfile = profile.value;
     extracted = null;
+    verification = null;
+    artifactAudit = null;
     setStatus("Profile changed. Extract again to apply it.");
     renderCapture();
   });
-  const profileHint = el("div", {
-    className: "profile-description",
-    textContent: captureProfile === "engineering"
-      ? "Includes the general checkpoint plus files, commands, work status, blockers, tests, and next actions."
-      : "Captures goals, decisions, constraints, questions, artifacts, and evidence for any kind of conversation.",
-  });
-  viewEl.append(el("label", { textContent: "Checkpoint profile" }), profile, profileHint);
-
-  const scan = el(
-    "button",
-    { className: "primary" },
-    el("span", { textContent: "Scan conversation" })
+  viewEl.append(
+    el("label", { textContent: "Checkpoint profile" }),
+    profile,
+    el("div", {
+      className: "profile-description",
+      textContent: captureProfile === "engineering"
+        ? "Adds files, commands, work status, blockers, tests, and next actions to the verified general checkpoint."
+        : "Goals, decisions, findings, constraints, questions, artifacts, and current resumption point.",
+    })
   );
-  scan.addEventListener("click", doScan);
-  viewEl.append(scan);
+
+  // Every step is always visible, in order, disabled until reachable — so the
+  // pipeline reads as Scan › Extract › Verify › Save at a glance.
+  const steps = [
+    ["Scan", doScan, true, true],
+    ["Extract", doExtract, !!scraped, false],
+    ["Verify", doVerify, !!extracted, false],
+    ["Save", doSave, !!extracted, false],
+  ];
+
+  const actions = el("div", { className: "actions" });
+  for (const [label, handler, enabled, primary] of steps) {
+    const btn = primary
+      ? el("button", { className: "primary" }, el("span", { textContent: label }))
+      : el("button", { textContent: label });
+    btn.disabled = !enabled;
+    btn.addEventListener("click", handler);
+    actions.append(el("div", { className: "step" }, btn));
+  }
+  viewEl.append(actions);
 
   if (!scraped) return;
 
-  const extract = el("button", { textContent: "Extract checkpoint" });
-  extract.style.marginLeft = "6px";
-  extract.addEventListener("click", doExtract);
-  viewEl.append(extract);
-
   if (extracted) {
-    const save = el("button", { textContent: "Save" });
-    save.style.marginLeft = "6px";
-    save.addEventListener("click", doSave);
-    viewEl.append(save);
-    viewEl.append(renderHealth({ state: extracted, verification: null }));
+    viewEl.append(
+      renderHealth(runHealthChecks(scraped.messages, extracted, verification))
+    );
     viewEl.append(renderState(extracted, captureProfile));
     return;
   }
@@ -189,25 +205,34 @@ async function renderCapture() {
   }
 }
 
-function renderHealth(checkpoint) {
-  const report = analyzeCheckpointHealth(checkpoint);
-  const card = el("section", { className: `health health-${report.status}` });
+const CHECK_ICON = { pass: "✓", warning: "⚠", blocker: "✗" };
+
+/** The health panel: every local check plus verification status, in one card. */
+function renderHealth(health) {
+  const card = el("div", { className: `health ${health.status.toLowerCase()}` });
   card.append(
-    el("div", { className: "health-title", textContent: `Health: ${report.status.toUpperCase()}` }),
+    el("h3", { textContent: `Health: ${health.status}` }),
     el("div", {
-      className: "meta",
-      textContent: `${report.counts.passed} passed · ${report.counts.warnings} warnings · ${report.counts.blockers} blockers`,
+      className: "tally",
+      textContent:
+        `${health.passed} passed · ${health.warnings} warning` +
+        `${health.warnings === 1 ? "" : "s"} · ${health.blockers} blocker` +
+        `${health.blockers === 1 ? "" : "s"}`,
     })
   );
 
-  for (const finding of report.findings) {
-    const icon = { pass: "✓", warning: "⚠", error: "✕" }[finding.severity];
+  for (const c of health.checks) {
     card.append(
       el(
         "div",
-        { className: `health-finding ${finding.severity}` },
-        el("div", { className: "title", textContent: `${icon} ${finding.label}` }),
-        el("div", { className: "meta", textContent: finding.detail })
+        { className: `check ${c.level}` },
+        el("div", { className: "icon", textContent: CHECK_ICON[c.level] }),
+        el(
+          "div",
+          { className: "body" },
+          el("div", { className: "t", textContent: c.title }),
+          el("div", { className: "d", textContent: c.detail })
+        )
       )
     );
   }
@@ -236,31 +261,35 @@ function renderState(state, profile = "general") {
       : null;
 
   section("Goal", state.goal && el("div", { className: "text", textContent: state.goal }));
+  section("Picking up from", state.resumptionPoint &&
+    el("div", { className: "text", textContent: state.resumptionPoint }));
   section("Decisions", lines(state.decisions, (d) =>
     d.rationale ? `• ${d.decision} — ${d.rationale}` : `• ${d.decision}`));
   section("Constraints", lines(state.constraints, (c) => `• ${c}`));
+  section("Established findings", lines(state.findings, (f) => `• ${f}`));
   section("Open questions", lines(state.openQuestions, (q) => `• ${q}`));
   section("Artifacts", lines(state.artifacts, (a) =>
     `${a.name} (${a.kind})\n${a.content}`));
   section("Glossary", lines(state.glossary, (g) => `${g.term}: ${g.meaning}`));
 
-  const eng = state.engineeringState;
-  if (profile === "engineering" || (eng && [eng.branch, ...(eng.completed ?? []), ...(eng.inProgress ?? []),
-    ...(eng.blocked ?? []), ...(eng.files ?? []), ...(eng.commands ?? []),
-    ...(eng.knownIssues ?? []), ...(eng.nextActions ?? []), ...(eng.definitionOfDone ?? [])].some(Boolean))) {
-    const engineeringLines = [];
-    if (!eng) engineeringLines.push("No engineering state was extracted.");
-    if (eng?.branch) engineeringLines.push(`Branch: ${eng.branch}`);
-    if (eng?.completed?.length) engineeringLines.push(`Completed:\n${eng.completed.map((x) => `✓ ${x}`).join("\n")}`);
-    if (eng?.inProgress?.length) engineeringLines.push(`In progress:\n${eng.inProgress.map((x) => `• ${x}`).join("\n")}`);
-    if (eng?.blocked?.length) engineeringLines.push(`Blocked:\n${eng.blocked.map((x) => `! ${x}`).join("\n")}`);
-    if (eng?.files?.length) engineeringLines.push(`Files:\n${eng.files.map((f) => `• ${f.path} — ${f.status}: ${f.purpose}`).join("\n")}`);
-    if (eng?.commands?.length) engineeringLines.push(`Commands:\n${eng.commands.map((c) => `• ${c.command} — ${c.result}`).join("\n")}`);
-    if (eng?.knownIssues?.length) engineeringLines.push(`Known issues:\n${eng.knownIssues.map((x) => `• ${x}`).join("\n")}`);
-    if (eng?.nextActions?.length) engineeringLines.push(`Next actions:\n${eng.nextActions.map((x) => `• ${x}`).join("\n")}`);
-    if (eng?.definitionOfDone?.length) engineeringLines.push(`Definition of done:\n${eng.definitionOfDone.map((x) => `• ${x}`).join("\n")}`);
-    if (eng && engineeringLines.length === 0) engineeringLines.push("No explicit SWE work state was found in this conversation.");
-    section("Engineering handoff", el("div", { className: "text", textContent: engineeringLines.join("\n\n") }));
+  if (profile === "engineering") {
+    const e = state.engineeringState;
+    const engineering = [];
+    if (e?.branch) engineering.push(`Branch: ${e.branch}`);
+    if (e?.completed?.length) engineering.push(`Completed:\n${e.completed.map((x) => `✓ ${x}`).join("\n")}`);
+    if (e?.inProgress?.length) engineering.push(`In progress:\n${e.inProgress.map((x) => `• ${x}`).join("\n")}`);
+    if (e?.blocked?.length) engineering.push(`Blocked:\n${e.blocked.map((x) => `! ${x}`).join("\n")}`);
+    if (e?.files?.length) engineering.push(`Files:\n${e.files.map((f) => `• ${f.path} — ${f.status}: ${f.purpose}`).join("\n")}`);
+    if (e?.commands?.length) engineering.push(`Commands:\n${e.commands.map((c) => `• ${c.command} — ${c.result || "result unknown"}`).join("\n")}`);
+    if (e?.knownIssues?.length) engineering.push(`Known issues:\n${e.knownIssues.map((x) => `• ${x}`).join("\n")}`);
+    if (e?.nextActions?.length) engineering.push(`Next actions:\n${e.nextActions.map((x) => `• ${x}`).join("\n")}`);
+    if (e?.definitionOfDone?.length) engineering.push(`Definition of done:\n${e.definitionOfDone.map((x) => `• ${x}`).join("\n")}`);
+    section("Engineering handoff", el("div", {
+      className: "text",
+      textContent: engineering.length
+        ? engineering.join("\n\n")
+        : "No explicit SWE work state was found in this conversation.",
+    }));
   }
 
   return frag;
@@ -275,31 +304,21 @@ async function renderSettings() {
     value: settings.openaiKey,
     placeholder: "sk-...",
   });
-  const anthropic = el("input", {
-    type: "password",
-    value: settings.anthropicKey,
-    placeholder: "sk-ant-...",
-  });
 
   const save = el(
     "button",
     { className: "primary" },
-    el("span", { textContent: "Save keys" })
+    el("span", { textContent: "Save key" })
   );
   save.style.marginTop = "14px";
   save.addEventListener("click", async () => {
-    await saveSettings({
-      openaiKey: openai.value.trim(),
-      anthropicKey: anthropic.value.trim(),
-    });
+    await saveSettings({ openaiKey: openai.value.trim() });
     setStatus("Saved.");
   });
 
   viewEl.append(
-    el("label", { textContent: "OpenAI key (extraction)" }),
+    el("label", { textContent: "OpenAI key" }),
     openai,
-    el("label", { textContent: "Anthropic key (verification)" }),
-    anthropic,
     save,
     el("div", {
       className: "hint",
@@ -328,18 +347,13 @@ function show(view) {
 // ---------------------------------------------------------------- actions
 
 function safeFilename(title) {
-  const base = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 60) || "checkpoint";
+  const base = title.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "").slice(0, 60) || "checkpoint";
   return `${base}.checkpoint.json`;
 }
 
 function downloadJson(filename, value) {
-  const blob = new Blob([JSON.stringify(value, null, 2)], {
-    type: "application/json",
-  });
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = el("a", { href: url, download: filename });
   document.body.append(anchor);
@@ -349,19 +363,18 @@ function downloadJson(filename, value) {
 }
 
 function doExport(cp, mode) {
-  const report = analyzeCheckpointHealth(cp);
-  const hasSecret = report.findings.some(
-    (finding) => finding.category === "Security" && finding.severity === "error"
+  const health = runHealthChecks(
+    cp.recentMessages ?? [], cp.state, cp.verification, cp.artifactAudit
   );
-  if (hasSecret) {
-    return setStatus("Export blocked: remove or redact the detected secret first.", true);
-  }
-  if (report.status === "blocked" && !window.confirm(
+  const hasSecret = health.checks.some(
+    (check) => check.level === "blocker" && /credential|secret/i.test(`${check.title} ${check.detail}`)
+  );
+  if (hasSecret) return setStatus("Export blocked: remove or redact the detected secret first.", true);
+  if (health.status === "BLOCKED" && !window.confirm(
     "This checkpoint has blocking health issues. Export it anyway?"
   )) return;
 
-  const payload = toShareable(cp, mode);
-  downloadJson(safeFilename(cp.title), payload);
+  downloadJson(safeFilename(cp.title), toShareable(cp, mode));
   setStatus(`${mode === "compact" ? "Compact handoff" : "Full checkpoint"} exported.`);
 }
 
@@ -372,11 +385,9 @@ async function doImport(input) {
   if (file.size > 10 * 1024 * 1024) {
     return setStatus("Import failed: checkpoint files must be smaller than 10 MB.", true);
   }
-
   setStatus("Importing checkpoint…");
   try {
-    const parsed = JSON.parse(await file.text());
-    const imported = await importCheckpoint(parsed);
+    const imported = await importCheckpoint(JSON.parse(await file.text()));
     selectedId = imported.id;
     setStatus("Checkpoint imported. Health was recomputed from its contents.");
     show("detail");
@@ -403,6 +414,8 @@ async function doScan() {
 
   scraped = { ...res, sourceUrl: tab.url, title: tab.title };
   extracted = null;
+  verification = null;
+  artifactAudit = null;
   const chars = res.messages.reduce((n, m) => n + m.text.length, 0);
   setStatus(
     `${res.messages.length} messages · ~${Math.round(chars / 4)} tokens (rough)`
@@ -423,6 +436,10 @@ async function doExtract() {
   if (!res?.ok) return setStatus(res?.error ?? "Extraction failed.", true);
 
   extracted = res.state;
+  verification = null;
+  // Free, instant, no model opinion involved — always run it.
+  artifactAudit = auditArtifacts(scraped.messages, extracted);
+
   const used = res.usage?.total_tokens;
   setStatus(`Extracted.${used ? ` ${used} tokens used.` : ""}`);
   renderCapture();
@@ -454,6 +471,24 @@ async function doRestore(cp) {
   setStatus("Opening a new chat… (also copied to clipboard)");
 }
 
+async function doVerify() {
+  if (!scraped || !extracted) return;
+  setStatus("Verifying with an independent model…");
+
+  const res = await chrome.runtime.sendMessage({
+    type: "VERIFY",
+    messages: scraped.messages,
+    state: extracted,
+    profile: captureProfile,
+  });
+
+  if (!res?.ok) return setStatus(res?.error ?? "Verification failed.", true);
+
+  verification = res.verification;
+  setStatus(`Verdict: ${verification.verdict.replace("_", " ")}.`);
+  renderCapture();
+}
+
 async function doSave() {
   if (!scraped || !extracted) return;
   await saveCheckpoint({
@@ -463,9 +498,16 @@ async function doSave() {
     messageCount: scraped.messages.length,
     state: extracted,
     profile: captureProfile,
+    verification,
+    artifactAudit,
+    // The verbatim live edge. Stored on the checkpoint so restore doesn't
+    // depend on the source conversation still existing.
+    recentMessages: selectTail(scraped.messages),
   });
   setStatus("Checkpoint saved.");
   extracted = null;
+  verification = null;
+  artifactAudit = null;
   show("checkpoints");
 }
 

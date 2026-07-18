@@ -4,7 +4,7 @@
 // per-Chrome-profile: not synced, not readable by other extensions or by pages.
 //
 // Shape:
-//   settings    -> { openaiKey, anthropicKey }
+//   settings    -> { openaiKey }
 //   checkpoints -> { [id]: Checkpoint }
 
 export const SCHEMA_VERSION = 1;
@@ -33,7 +33,7 @@ const LOCAL_ONLY_FIELDS = ["sourceUrl"];
 
 export async function getSettings() {
   const { settings } = await chrome.storage.local.get("settings");
-  return settings ?? { openaiKey: "", anthropicKey: "" };
+  return settings ?? { openaiKey: "" };
 }
 
 export async function saveSettings(patch) {
@@ -108,12 +108,34 @@ export async function takePendingRestore(platform) {
   return pendingRestore.text;
 }
 
+// Compression is only justified where information density is low — old,
+// settled, superseded turns. The last few exchanges are the densest part of
+// the conversation and the cheapest to carry, so they ride along verbatim.
+// This is what makes a resume start exactly where the old chat ended rather
+// than approximately near it.
+export const TAIL_COUNT = 6;
+export const TAIL_CHAR_BUDGET = 6000;
+
+/** Take the last few messages, newest-first, until either limit is hit. */
+export function selectTail(messages, count = TAIL_COUNT, budget = TAIL_CHAR_BUDGET) {
+  const tail = [];
+  let used = 0;
+  for (let i = messages.length - 1; i >= 0 && tail.length < count; i--) {
+    const m = messages[i];
+    // Always keep at least one, even if it alone blows the budget.
+    if (tail.length > 0 && used + m.text.length > budget) break;
+    tail.unshift(m);
+    used += m.text.length;
+  }
+  return tail;
+}
+
 /** Render a checkpoint into a paste-ready prompt for a fresh chat. */
 export function formatRestorePrompt(cp) {
   const s = cp.state;
   const out = [
-    "I'm resuming earlier work. Below is the state of that conversation.",
-    "Treat the decisions as settled — don't re-litigate them or re-ask what's already answered. Acknowledge in one line, then continue from here.",
+    "I'm resuming earlier work. Below is the state of that conversation: a compressed record of the history, then the most recent messages verbatim.",
+    "Treat the decisions as settled — don't re-litigate them or re-ask what's already answered. Acknowledge in one line, then continue.",
     "",
     `## Goal\n${s.goal}`,
   ];
@@ -126,6 +148,11 @@ export function formatRestorePrompt(cp) {
     d.rationale ? `- ${d.decision} (because: ${d.rationale})` : `- ${d.decision}`
   );
   section("Constraints", s.constraints, (c) => `- ${c}`);
+  section(
+    "Already established (do not re-derive or contradict)",
+    s.findings,
+    (f) => `- ${f}`
+  );
   section("Open questions", s.openQuestions, (q) => `- ${q}`);
   section("Glossary", s.glossary, (g) => `- ${g.term}: ${g.meaning}`);
 
@@ -149,11 +176,29 @@ export function formatRestorePrompt(cp) {
     add("Known issues", e.knownIssues);
     add("Next actions", e.nextActions);
     add("Definition of done", e.definitionOfDone);
-    if (e.files?.length) engineering.push(`Files:\n${e.files.map((f) => `- ${f.path} — ${f.status}: ${f.purpose}`).join("\n")}`);
-    if (e.commands?.length) engineering.push(`Commands:\n${e.commands.map((c) => `- ${c.command} — ${c.result}`).join("\n")}`);
+    if (e.files?.length) engineering.push(
+      `Files:\n${e.files.map((f) => `- ${f.path} — ${f.status}: ${f.purpose}`).join("\n")}`
+    );
+    if (e.commands?.length) engineering.push(
+      `Commands:\n${e.commands.map((c) => `- ${c.command} — ${c.result || "result unknown"}`).join("\n")}`
+    );
     if (engineering.length) out.push("", "## Engineering handoff", engineering.join("\n\n"));
   }
 
+  if (s.resumptionPoint) {
+    out.push("", "## Where we left off", s.resumptionPoint);
+  }
+
+  // Verbatim tail goes LAST: it's the live edge of the conversation, and
+  // recency drives what the model actually acts on.
+  if (cp.recentMessages?.length) {
+    out.push("", "## The last few messages, verbatim");
+    for (const m of cp.recentMessages) {
+      out.push("", `[${m.role.toUpperCase()}]`, m.text);
+    }
+  }
+
+  out.push("", "---", "Continue from exactly this point.");
   return out.join("\n");
 }
 
@@ -163,23 +208,18 @@ export function formatRestorePrompt(cp) {
 
 /** Strip local-only fields. ALWAYS route outbound checkpoints through this. */
 export function toShareable(checkpoint, mode = "full") {
-  // Deep clone so creating a compact export cannot mutate the saved record.
   const copy = JSON.parse(JSON.stringify(checkpoint));
   for (const field of LOCAL_ONLY_FIELDS) delete copy[field];
   delete copy.health;
   delete copy.healthScore;
-
   copy.sharing = {
     exportedAt: new Date().toISOString(),
     mode,
     format: "memento-checkpoint",
   };
-
   if (mode === "compact") {
-    // Compact handoffs preserve resumable state but omit evidence-level details
-    // and verification, which can contain more transcript-derived material.
-    delete copy.state?.claims;
     copy.verification = null;
+    delete copy.recentMessages;
   }
   return copy;
 }
@@ -203,7 +243,9 @@ export async function importCheckpoint(incoming) {
   if (!incoming.state || typeof incoming.state !== "object" || !incoming.state.goal) {
     throw new Error("The checkpoint is missing resumable state or a goal.");
   }
-  for (const field of ["decisions", "constraints", "openQuestions", "artifacts", "glossary"]) {
+  for (const field of [
+    "decisions", "findings", "constraints", "openQuestions", "artifacts", "glossary",
+  ]) {
     if (!Array.isArray(incoming.state[field])) {
       throw new Error(`Invalid checkpoint state: ${field} must be an array.`);
     }

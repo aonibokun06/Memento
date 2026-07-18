@@ -22,6 +22,40 @@
         text-decoration: underline;
       }
       nav { display: flex; gap: 6px; margin-bottom: 12px; }
+      .actions {
+        display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0;
+      }
+      /* Every step stays visible and in order; disabled communicates "not yet"
+         so the pipeline reads as a sequence rather than a pile of buttons. */
+      button:disabled { opacity: 0.3; cursor: not-allowed; }
+      .step { display: flex; align-items: center; gap: 6px; }
+      .step::after {
+        content: "›"; opacity: 0.35; font-size: 15px;
+      }
+      .step:last-child::after { content: ""; }
+
+      .health {
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--accent, #888);
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin: 12px 0;
+      }
+      .health.healthy { --accent: #2e9e5b; }
+      .health.review  { --accent: #d19a1d; }
+      .health.blocked { --accent: #c0392b; }
+      .health h3 {
+        margin: 0; font-size: 13px; letter-spacing: 0.04em;
+      }
+      .health .tally { font-size: 11px; opacity: 0.65; margin: 2px 0 8px; }
+      .check { display: flex; gap: 7px; padding: 5px 0; align-items: baseline; }
+      .check .icon { flex: none; width: 13px; }
+      .check .body { min-width: 0; }
+      .check .t { font-weight: 600; }
+      .check .d { font-size: 11px; opacity: 0.7; }
+      .check.pass .icon { color: #2e9e5b; }
+      .check.warning .icon { color: #d19a1d; }
+      .check.blocker .icon { color: #c0392b; }
       nav button[aria-current="true"] { font-weight: 600; opacity: 1; }
       nav button { border: none; opacity: 0.55; padding: 4px 6px; }
 
@@ -55,26 +89,12 @@
       }
       .hint { font-size: 11px; opacity: 0.6; margin-top: 4px; }
       .empty { opacity: 0.6; padding: 24px 0; text-align: center; }
-      .health {
-        border: 1px solid var(--line); border-left-width: 4px;
-        border-radius: 7px; padding: 10px; margin: 12px 0;
-      }
-      .health-ready { border-left-color: #27864a; }
-      .health-review { border-left-color: #c58a13; }
-      .health-blocked { border-left-color: #c0392b; }
-      .health-title { font-weight: 700; letter-spacing: 0.03em; }
-      .health-finding { padding-top: 8px; }
-      .health-finding.pass .title { color: #27864a; }
-      .health-finding.warning .title { color: #9a690b; }
-      .health-finding.error .title { color: #c0392b; }
       .profile-badge {
         display: inline-block; margin-top: 10px; padding: 3px 7px;
         border-radius: 999px; background: var(--line); font-size: 11px;
       }
       .profile-description { font-size: 11px; opacity: 0.7; margin: 4px 0 10px; }
       .share-toolbar { margin-bottom: 10px; }
-      .detail-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
-      .detail-actions button { margin: 0 !important; }
     </style>
   </head>
   <body>

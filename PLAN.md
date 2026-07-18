@@ -1,5 +1,19 @@
 # Memento — Hackathon Plan
 
+## North star
+
+**The new conversation starts exactly where the old one ended, losing nothing
+that matters.**
+
+The success test is not "is this a good summary." It is: *the new assistant's
+next reply should be as good as if the entire conversation were still in its
+context.* Every design decision gets judged against that, and when compression
+and fidelity conflict, fidelity wins — we are not optimizing for a short
+checkpoint, we are optimizing for a seamless resume.
+
+---
+
+
 Chrome extension that sits alongside ChatGPT/Claude and does two things:
 
 1. **Checkpoint & restore** — extract the durable state of a conversation, verify it, and let you resume it in a fresh chat. *(the differentiator)*
