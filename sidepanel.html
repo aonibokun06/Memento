@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Memento</title>
+    <style>
+      :root { color-scheme: light dark; --line: rgba(128,128,128,0.28); }
+      * { box-sizing: border-box; }
+      body {
+        font: 13px/1.5 ui-sans-serif, system-ui, sans-serif;
+        margin: 0; padding: 12px;
+      }
+      button {
+        font: inherit; padding: 5px 10px; border-radius: 6px;
+        border: 1px solid currentColor; background: transparent;
+        color: inherit; cursor: pointer;
+      }
+      button.primary { background: currentColor; }
+      button.primary span { color: Canvas; }
+      button.link {
+        border: none; padding: 2px 4px; opacity: 0.7;
+        text-decoration: underline;
+      }
+      nav { display: flex; gap: 6px; margin-bottom: 12px; }
+      nav button[aria-current="true"] { font-weight: 600; opacity: 1; }
+      nav button { border: none; opacity: 0.55; padding: 4px 6px; }
+
+      #status { margin: 10px 0; opacity: 0.7; }
+      #status.error { opacity: 1; color: #c0392b; }
+
+      .row {
+        border-top: 1px solid var(--line);
+        padding: 9px 0; display: flex; gap: 8px; align-items: baseline;
+      }
+      .row .grow { flex: 1; min-width: 0; }
+      .row .title {
+        font-weight: 600; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis;
+      }
+      .meta { font-size: 11px; opacity: 0.6; }
+
+      .msg { border-top: 1px solid var(--line); padding: 8px 0; }
+      .role {
+        font-weight: 600; text-transform: uppercase; font-size: 11px;
+        letter-spacing: 0.05em; opacity: 0.6;
+      }
+      .text {
+        white-space: pre-wrap; word-break: break-word;
+        max-height: 8em; overflow-y: auto;
+      }
+      label { display: block; margin: 12px 0 4px; font-weight: 600; }
+      input {
+        font: inherit; width: 100%; padding: 6px 8px; border-radius: 6px;
+        border: 1px solid var(--line); background: transparent; color: inherit;
+      }
+      .hint { font-size: 11px; opacity: 0.6; margin-top: 4px; }
+      .empty { opacity: 0.6; padding: 24px 0; text-align: center; }
+    </style>
+  </head>
+  <body>
+    <nav>
+      <button data-view="checkpoints">Checkpoints</button>
+      <button data-view="capture">Capture</button>
+      <button data-view="settings">Settings</button>
+    </nav>
+    <div id="status"></div>
+    <main id="view"></main>
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>
