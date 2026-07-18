@@ -4,7 +4,7 @@
 // per-Chrome-profile: not synced, not readable by other extensions or by pages.
 //
 // Shape:
-//   settings    -> { openaiKey, anthropicKey }
+//   settings    -> { openaiKey }
 //   checkpoints -> { [id]: Checkpoint }
 
 export const SCHEMA_VERSION = 1;
@@ -32,7 +32,7 @@ const LOCAL_ONLY_FIELDS = ["sourceUrl"];
 
 export async function getSettings() {
   const { settings } = await chrome.storage.local.get("settings");
-  return settings ?? { openaiKey: "", anthropicKey: "" };
+  return settings ?? { openaiKey: "" };
 }
 
 export async function saveSettings(patch) {
@@ -107,12 +107,34 @@ export async function takePendingRestore(platform) {
   return pendingRestore.text;
 }
 
+// Compression is only justified where information density is low — old,
+// settled, superseded turns. The last few exchanges are the densest part of
+// the conversation and the cheapest to carry, so they ride along verbatim.
+// This is what makes a resume start exactly where the old chat ended rather
+// than approximately near it.
+export const TAIL_COUNT = 6;
+export const TAIL_CHAR_BUDGET = 6000;
+
+/** Take the last few messages, newest-first, until either limit is hit. */
+export function selectTail(messages, count = TAIL_COUNT, budget = TAIL_CHAR_BUDGET) {
+  const tail = [];
+  let used = 0;
+  for (let i = messages.length - 1; i >= 0 && tail.length < count; i--) {
+    const m = messages[i];
+    // Always keep at least one, even if it alone blows the budget.
+    if (tail.length > 0 && used + m.text.length > budget) break;
+    tail.unshift(m);
+    used += m.text.length;
+  }
+  return tail;
+}
+
 /** Render a checkpoint into a paste-ready prompt for a fresh chat. */
 export function formatRestorePrompt(cp) {
   const s = cp.state;
   const out = [
-    "I'm resuming earlier work. Below is the state of that conversation.",
-    "Treat the decisions as settled — don't re-litigate them or re-ask what's already answered. Acknowledge in one line, then continue from here.",
+    "I'm resuming earlier work. Below is the state of that conversation: a compressed record of the history, then the most recent messages verbatim.",
+    "Treat the decisions as settled — don't re-litigate them or re-ask what's already answered. Acknowledge in one line, then continue.",
     "",
     `## Goal\n${s.goal}`,
   ];
@@ -125,6 +147,11 @@ export function formatRestorePrompt(cp) {
     d.rationale ? `- ${d.decision} (because: ${d.rationale})` : `- ${d.decision}`
   );
   section("Constraints", s.constraints, (c) => `- ${c}`);
+  section(
+    "Already established (do not re-derive or contradict)",
+    s.findings,
+    (f) => `- ${f}`
+  );
   section("Open questions", s.openQuestions, (q) => `- ${q}`);
   section("Glossary", s.glossary, (g) => `- ${g.term}: ${g.meaning}`);
 
@@ -135,6 +162,20 @@ export function formatRestorePrompt(cp) {
     }
   }
 
+  if (s.resumptionPoint) {
+    out.push("", "## Where we left off", s.resumptionPoint);
+  }
+
+  // Verbatim tail goes LAST: it's the live edge of the conversation, and
+  // recency drives what the model actually acts on.
+  if (cp.recentMessages?.length) {
+    out.push("", "## The last few messages, verbatim");
+    for (const m of cp.recentMessages) {
+      out.push("", `[${m.role.toUpperCase()}]`, m.text);
+    }
+  }
+
+  out.push("", "---", "Continue from exactly this point.");
   return out.join("\n");
 }
 

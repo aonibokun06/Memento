@@ -7,7 +7,9 @@ import {
   saveSettings,
   formatRestorePrompt,
   setPendingRestore,
+  selectTail,
 } from "./storage.js";
+import { auditArtifacts, runHealthChecks } from "./audit.js";
 
 const statusEl = document.getElementById("status");
 const viewEl = document.getElementById("view");
@@ -15,6 +17,8 @@ const viewEl = document.getElementById("view");
 let currentView = "checkpoints";
 let scraped = null; // last scan result, held in memory only
 let extracted = null; // last extraction result, held in memory only
+let verification = null; // independent model's audit of `extracted`
+let artifactAudit = null; // deterministic verbatim check, no model involved
 let selectedId = null; // checkpoint open in the detail view
 
 function setStatus(text = "", isError = false) {
@@ -97,34 +101,39 @@ async function renderDetail() {
     show("checkpoints");
   });
 
-  for (const b of [restore, copy, del]) b.style.marginRight = "6px";
-  viewEl.append(back, el("div", {}, restore, copy, del));
+  viewEl.append(back, el("div", { className: "actions" }, restore, copy, del));
   if (cp.state) viewEl.append(renderState(cp.state));
 }
 
 async function renderCapture() {
   viewEl.replaceChildren();
 
-  const scan = el(
-    "button",
-    { className: "primary" },
-    el("span", { textContent: "Scan conversation" })
-  );
-  scan.addEventListener("click", doScan);
-  viewEl.append(scan);
+  // Every step is always visible, in order, disabled until reachable — so the
+  // pipeline reads as Scan › Extract › Verify › Save at a glance.
+  const steps = [
+    ["Scan", doScan, true, true],
+    ["Extract", doExtract, !!scraped, false],
+    ["Verify", doVerify, !!extracted, false],
+    ["Save", doSave, !!extracted, false],
+  ];
+
+  const actions = el("div", { className: "actions" });
+  for (const [label, handler, enabled, primary] of steps) {
+    const btn = primary
+      ? el("button", { className: "primary" }, el("span", { textContent: label }))
+      : el("button", { textContent: label });
+    btn.disabled = !enabled;
+    btn.addEventListener("click", handler);
+    actions.append(el("div", { className: "step" }, btn));
+  }
+  viewEl.append(actions);
 
   if (!scraped) return;
 
-  const extract = el("button", { textContent: "Extract checkpoint" });
-  extract.style.marginLeft = "6px";
-  extract.addEventListener("click", doExtract);
-  viewEl.append(extract);
-
   if (extracted) {
-    const save = el("button", { textContent: "Save" });
-    save.style.marginLeft = "6px";
-    save.addEventListener("click", doSave);
-    viewEl.append(save);
+    viewEl.append(
+      renderHealth(runHealthChecks(scraped.messages, extracted, verification))
+    );
     viewEl.append(renderState(extracted));
     return;
   }
@@ -139,6 +148,40 @@ async function renderCapture() {
       )
     );
   }
+}
+
+const CHECK_ICON = { pass: "✓", warning: "⚠", blocker: "✗" };
+
+/** The health panel: every local check plus verification status, in one card. */
+function renderHealth(health) {
+  const card = el("div", { className: `health ${health.status.toLowerCase()}` });
+  card.append(
+    el("h3", { textContent: `Health: ${health.status}` }),
+    el("div", {
+      className: "tally",
+      textContent:
+        `${health.passed} passed · ${health.warnings} warning` +
+        `${health.warnings === 1 ? "" : "s"} · ${health.blockers} blocker` +
+        `${health.blockers === 1 ? "" : "s"}`,
+    })
+  );
+
+  for (const c of health.checks) {
+    card.append(
+      el(
+        "div",
+        { className: `check ${c.level}` },
+        el("div", { className: "icon", textContent: CHECK_ICON[c.level] }),
+        el(
+          "div",
+          { className: "body" },
+          el("div", { className: "t", textContent: c.title }),
+          el("div", { className: "d", textContent: c.detail })
+        )
+      )
+    );
+  }
+  return card;
 }
 
 /** Render an extracted checkpoint as readable sections, not raw JSON. */
@@ -163,9 +206,12 @@ function renderState(state) {
       : null;
 
   section("Goal", state.goal && el("div", { className: "text", textContent: state.goal }));
+  section("Picking up from", state.resumptionPoint &&
+    el("div", { className: "text", textContent: state.resumptionPoint }));
   section("Decisions", lines(state.decisions, (d) =>
     d.rationale ? `• ${d.decision} — ${d.rationale}` : `• ${d.decision}`));
   section("Constraints", lines(state.constraints, (c) => `• ${c}`));
+  section("Established findings", lines(state.findings, (f) => `• ${f}`));
   section("Open questions", lines(state.openQuestions, (q) => `• ${q}`));
   section("Artifacts", lines(state.artifacts, (a) =>
     `${a.name} (${a.kind})\n${a.content}`));
@@ -183,31 +229,21 @@ async function renderSettings() {
     value: settings.openaiKey,
     placeholder: "sk-...",
   });
-  const anthropic = el("input", {
-    type: "password",
-    value: settings.anthropicKey,
-    placeholder: "sk-ant-...",
-  });
 
   const save = el(
     "button",
     { className: "primary" },
-    el("span", { textContent: "Save keys" })
+    el("span", { textContent: "Save key" })
   );
   save.style.marginTop = "14px";
   save.addEventListener("click", async () => {
-    await saveSettings({
-      openaiKey: openai.value.trim(),
-      anthropicKey: anthropic.value.trim(),
-    });
+    await saveSettings({ openaiKey: openai.value.trim() });
     setStatus("Saved.");
   });
 
   viewEl.append(
-    el("label", { textContent: "OpenAI key (extraction)" }),
+    el("label", { textContent: "OpenAI key" }),
     openai,
-    el("label", { textContent: "Anthropic key (verification)" }),
-    anthropic,
     save,
     el("div", {
       className: "hint",
@@ -272,6 +308,10 @@ async function doExtract() {
   if (!res?.ok) return setStatus(res?.error ?? "Extraction failed.", true);
 
   extracted = res.state;
+  verification = null;
+  // Free, instant, no model opinion involved — always run it.
+  artifactAudit = auditArtifacts(scraped.messages, extracted);
+
   const used = res.usage?.total_tokens;
   setStatus(`Extracted.${used ? ` ${used} tokens used.` : ""}`);
   renderCapture();
@@ -303,6 +343,23 @@ async function doRestore(cp) {
   setStatus("Opening a new chat… (also copied to clipboard)");
 }
 
+async function doVerify() {
+  if (!scraped || !extracted) return;
+  setStatus("Verifying with an independent model…");
+
+  const res = await chrome.runtime.sendMessage({
+    type: "VERIFY",
+    messages: scraped.messages,
+    state: extracted,
+  });
+
+  if (!res?.ok) return setStatus(res?.error ?? "Verification failed.", true);
+
+  verification = res.verification;
+  setStatus(`Verdict: ${verification.verdict.replace("_", " ")}.`);
+  renderCapture();
+}
+
 async function doSave() {
   if (!scraped || !extracted) return;
   await saveCheckpoint({
@@ -311,9 +368,16 @@ async function doSave() {
     sourceUrl: scraped.sourceUrl,
     messageCount: scraped.messages.length,
     state: extracted,
+    verification,
+    artifactAudit,
+    // The verbatim live edge. Stored on the checkpoint so restore doesn't
+    // depend on the source conversation still existing.
+    recentMessages: selectTail(scraped.messages),
   });
   setStatus("Checkpoint saved.");
   extracted = null;
+  verification = null;
+  artifactAudit = null;
   show("checkpoints");
 }
 
