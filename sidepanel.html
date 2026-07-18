@@ -95,6 +95,29 @@
       }
       .profile-description { font-size: 11px; opacity: 0.7; margin: 4px 0 10px; }
       .share-toolbar { margin-bottom: 10px; }
+
+      .meter { margin: 0 0 12px; }
+      .meter .top {
+        display: flex; justify-content: space-between;
+        align-items: baseline; gap: 8px; font-size: 11px;
+      }
+      .meter .pct { font-weight: 600; font-size: 13px; }
+      .meter .sub { opacity: 0.6; }
+      .meter .track {
+        height: 5px; border-radius: 999px; margin: 5px 0 4px;
+        background: rgba(128, 128, 128, 0.25); overflow: hidden;
+      }
+      .meter .fill {
+        height: 100%; border-radius: 999px;
+        background: var(--meter, #2e9e5b); transition: width 0.3s ease;
+      }
+      .meter.notice { --meter: #d19a1d; }
+      .meter.urgent { --meter: #c0392b; }
+      .meter .warn {
+        font-size: 11px; margin-top: 6px;
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      }
+      .meter.urgent .warn { color: #c0392b; font-weight: 600; }
     </style>
   </head>
   <body>

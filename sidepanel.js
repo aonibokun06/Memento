@@ -12,6 +12,7 @@ import {
   importCheckpoint,
 } from "./storage.js";
 import { auditArtifacts, runHealthChecks } from "./audit.js";
+import { analyze, formatTokens } from "./meter.js";
 import { PROFILE_OPTIONS } from "./profiles.js";
 
 const statusEl = document.getElementById("status");
@@ -24,6 +25,7 @@ let verification = null; // independent model's audit of `extracted`
 let artifactAudit = null; // deterministic verbatim check, no model involved
 let captureProfile = "general";
 let selectedId = null; // checkpoint open in the detail view
+let meterState = null; // latest context reading from the content script
 
 function setStatus(text = "", isError = false) {
   statusEl.textContent = text;
@@ -137,6 +139,9 @@ async function renderDetail() {
 async function renderCapture() {
   viewEl.replaceChildren();
 
+  const meterEl = renderMeter(meterState);
+  if (meterEl) viewEl.append(meterEl);
+
   const profile = el("select");
   for (const option of PROFILE_OPTIONS) {
     profile.append(el("option", { value: option.id, textContent: option.label }));
@@ -201,6 +206,64 @@ async function renderCapture() {
       )
     );
   }
+}
+
+/**
+ * Live context readout. Renders nothing until a Scan has established a
+ * baseline — virtualization means an un-scanned conversation would report only
+ * what's on screen, and a confidently wrong number is worse than none.
+ */
+function renderMeter(meter) {
+  if (!meter?.hasBaseline) return null;
+
+  const m = analyze(meter);
+  const box = el("div", { className: `meter ${m.level}` });
+
+  box.append(
+    el(
+      "div",
+      { className: "top" },
+      el("span", { className: "pct", textContent: `${Math.round(m.ratio * 100)}%` }),
+      el("span", {
+        className: "sub",
+        textContent:
+          `~${formatTokens(m.tokens)} / ${formatTokens(m.context)}` +
+          (meter.model ? ` · ${meter.model}` : ""),
+      })
+    ),
+    el(
+      "div",
+      { className: "track" },
+      el("div", {
+        className: "fill",
+        style: `width:${Math.max(m.ratio * 100, 2)}%`,
+      })
+    ),
+    el("div", {
+      className: "top sub",
+      // Estimated, and labelled as such: we can't see the platform's hidden
+      // system prompt, tool schemas, or injected memory.
+      textContent: `~$${m.cost.toFixed(2)} est. · ${meter.messages} messages`,
+    })
+  );
+
+  if (m.level !== "calm") {
+    const warn = el("div", { className: "warn" });
+    warn.append(
+      el("span", {
+        textContent:
+          m.turnsLeft !== null
+            ? `~${m.turnsLeft} messages left at this pace`
+            : "Approaching the context limit",
+      })
+    );
+    const cta = el("button", { textContent: "Checkpoint now" });
+    cta.addEventListener("click", doQuickCheckpoint);
+    warn.append(cta);
+    box.append(warn);
+  }
+
+  return box;
 }
 
 const CHECK_ICON = { pass: "✓", warning: "⚠", blocker: "✗" };
@@ -488,8 +551,8 @@ async function doVerify() {
 }
 
 async function doSave() {
-  if (!scraped || !extracted) return;
-  await saveCheckpoint({
+  if (!scraped || !extracted) return null;
+  const saved = await saveCheckpoint({
     title: extracted.title || scraped.title || "Untitled conversation",
     platform: scraped.host,
     sourceUrl: scraped.sourceUrl,
@@ -507,7 +570,43 @@ async function doSave() {
   verification = null;
   artifactAudit = null;
   show("checkpoints");
+  return saved;
 }
+
+/**
+ * Scan → extract → save → restore in one click. The whole point of the
+ * warning: every step the user has to perform themselves is a step where
+ * they'll shrug and keep going in a degraded conversation.
+ *
+ * Verification is deliberately NOT in this path — it doubles the wait and
+ * costs a call. The free deterministic health checks still run, and Verify
+ * stays available as its own button.
+ */
+async function doQuickCheckpoint() {
+  show("capture");
+  await doScan();
+  if (!scraped) return;
+
+  await doExtract();
+  if (!extracted) return;
+
+  const cp = await doSave();
+  if (cp) await doRestore(cp);
+}
+
+// The content script writes readings to storage; mirror them into the UI.
+// Storage is the transport here so the panel is correct even if it was closed
+// while the conversation grew.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.meter) return;
+  meterState = changes.meter.newValue;
+  if (currentView === "capture") renderCapture();
+});
+
+chrome.storage.local.get("meter").then(({ meter }) => {
+  meterState = meter ?? null;
+  if (currentView === "capture") renderCapture();
+});
 
 // ------------------------------------------------------------------- boot
 

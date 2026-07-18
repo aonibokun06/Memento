@@ -3,10 +3,26 @@
 
 import { getSettings } from "./storage.js";
 import { resolveProfile } from "./profiles.js";
+import { analyze } from "./meter.js";
 
 chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((err) => console.error("[memento]", err));
+
+// Mirror the context meter onto the toolbar icon, so the warning reaches the
+// user without the side panel being open. This is the difference between a
+// meter you remember to check and one that tells you.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.meter) return;
+  const meter = changes.meter.newValue;
+  if (!meter?.hasBaseline) return chrome.action.setBadgeText({ text: "" });
+
+  const { ratio, level } = analyze(meter);
+  chrome.action.setBadgeText({ text: `${Math.round(ratio * 100)}%` });
+  chrome.action.setBadgeBackgroundColor({
+    color: { calm: "#2e9e5b", notice: "#d19a1d", urgent: "#c0392b" }[level],
+  });
+});
 
 // Extraction needs the LARGEST context window available: the whole point is
 // long conversations, and a model that can't hold the transcript can't extract

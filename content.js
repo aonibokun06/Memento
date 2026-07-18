@@ -162,7 +162,9 @@ async function harvest(scraper) {
   collect();
 
   box.scrollTop = restore;
-  return [...seen.values()].map(({ role, text }) => ({ role, text }));
+  // Keys are kept here (not stripped) so the meter can seed its counted-set
+  // from the same identities the observer will use. scrape() strips them.
+  return [...seen.values()];
 }
 
 async function scrape() {
@@ -170,13 +172,26 @@ async function scrape() {
   const scraper = SCRAPERS[host];
   if (!scraper) return { ok: false, error: `No scraper for ${host}` };
 
-  const messages = await harvest(scraper);
+  const harvested = await harvest(scraper);
+  const messages = harvested.map(({ role, text }) => ({ role, text }));
   if (messages.length === 0) {
     return {
       ok: false,
       error: `Scraped 0 messages on ${host}. Selectors are probably stale — run __memento.debug() in this console (switch the console context to Memento first).`,
     };
   }
+  // A scan is the only time we see the whole thread, so it's the only reliable
+  // baseline for the meter. Rebuild the total from it rather than trusting the
+  // incremental count, which can only have seen rendered messages.
+  resetMeter();
+  for (const m of harvested) {
+    counted.add(m.key); // same identity the observer uses — no double-counting
+    meterChars += m.text.length;
+    meterTurns.push(m.text.length);
+  }
+  meterBaselined = true; // the whole thread is now accounted for
+  publishMeter();
+
   return { ok: true, host, messages, scrapedAt: Date.now() };
 }
 
@@ -194,6 +209,114 @@ function debug() {
     if (attrs.length) console.log(node.tagName.toLowerCase(), attrs.join(" "));
     node = node.parentElement;
   }
+}
+
+// ------------------------------------------------------------- the meter
+//
+// Runs continuously and entirely locally: no network, no key, no cost.
+//
+// Virtualization means a live observer only ever sees the current viewport, so
+// a running total can't be built from observation alone. Instead the baseline
+// comes from a Scan (which harvests the whole thread), and the observer adds
+// new messages as they arrive. Counted keys are tracked so re-renders of
+// already-seen messages don't double-count.
+
+const counted = new Set();
+let meterChars = 0;
+let meterTurns = []; // chars per recent turn, for pace projection
+
+// True only after a Scan has harvested the whole thread. Until then the count
+// is just "what has happened to render", which climbs as the user scrolls up
+// through old messages — a number that looks live but means nothing. The UI
+// hides the meter entirely while this is false.
+let meterBaselined = false;
+
+// ~4 chars per token. Off by 15-20%, which is fine for a threshold and costs
+// nothing. A real tokenizer would need a bundler — see CONTEXT-METER.md.
+const estimateTokens = (chars) => Math.round(chars / 4);
+
+/** Which conversation are we in? Resets the meter when it changes. */
+const conversationId = () => location.pathname;
+
+// Model pickers move around; try several hooks and degrade gracefully. A
+// missing model means a conservative default window, not a hidden meter.
+const MODEL_SELECTORS = [
+  '[data-testid="model-switcher-dropdown-button"]',
+  '[data-testid*="model"]',
+  'button[aria-haspopup="menu"] [class*="model"]',
+  'button[aria-label*="model" i]',
+];
+
+function detectModel() {
+  for (const sel of MODEL_SELECTORS) {
+    const text = document.querySelector(sel)?.innerText?.trim();
+    if (text && text.length < 40) return text.split("\n")[0];
+  }
+  return null;
+}
+
+async function publishMeter() {
+  await chrome.storage.local.set({
+    meter: {
+      conversationId: conversationId(),
+      host: location.hostname.replace(/^www\./, ""),
+      model: detectModel(),
+      chars: meterChars,
+      tokens: estimateTokens(meterChars),
+      messages: counted.size,
+      recentTurnTokens: meterTurns.slice(-5).map(estimateTokens),
+      hasBaseline: meterBaselined,
+      updatedAt: Date.now(),
+    },
+  });
+}
+
+/** Count anything currently rendered that we haven't seen before. */
+function countVisible() {
+  const scraper = SCRAPERS[location.hostname.replace(/^www\./, "")];
+  if (!scraper) return false;
+
+  let added = false;
+  for (const m of scraper()) {
+    if (!m.text || counted.has(m.key)) continue;
+    counted.add(m.key);
+    meterChars += m.text.length;
+    meterTurns.push(m.text.length);
+    added = true;
+  }
+  return added;
+}
+
+function resetMeter() {
+  counted.clear();
+  meterChars = 0;
+  meterTurns = [];
+  meterBaselined = false;
+}
+
+let meterTimer = null;
+let lastConversation = conversationId();
+
+function scheduleMeterUpdate() {
+  clearTimeout(meterTimer);
+  // Debounced: streaming responses mutate the DOM constantly, and counting on
+  // every keystroke-sized change would burn CPU for no added accuracy.
+  meterTimer = setTimeout(() => {
+    if (conversationId() !== lastConversation) {
+      lastConversation = conversationId();
+      resetMeter();
+    }
+    if (countVisible()) publishMeter();
+  }, 600);
+}
+
+function startMeter() {
+  countVisible();
+  publishMeter();
+  new MutationObserver(scheduleMeterUpdate).observe(document.body, {
+    childList: true,
+    subtree: true,
+  });
 }
 
 // -------------------------------------------------------------- restoring
@@ -237,6 +360,7 @@ async function applyPendingRestore() {
 }
 
 applyPendingRestore();
+startMeter();
 
 globalThis.__memento = { scrape, debug, harvest, fillComposer };
 
