@@ -115,17 +115,15 @@ async function renderDetail() {
     show("checkpoints");
   });
 
-  const exportFull = el("button", { textContent: "Export full" });
-  exportFull.addEventListener("click", () => doExport(cp, "full"));
-  const exportCompact = el("button", { textContent: "Export compact" });
-  exportCompact.addEventListener("click", () => doExport(cp, "compact"));
+  const exportBtn = el("button", { textContent: "Export" });
+  exportBtn.addEventListener("click", () => doExport(cp, "full"));
 
   viewEl.append(
     back,
-    el("div", { className: "actions" }, restore, copy, exportFull, exportCompact, del),
+    el("div", { className: "actions" }, restore, copy, exportBtn, del),
     el("div", {
       className: "profile-badge",
-      textContent: cp.profile === "engineering" ? "Engineering profile" : "Business / General profile",
+      textContent: cp.profile === "engineering" ? "Engineering profile" : "General profile",
     })
   );
   if (cp.state) {
@@ -375,7 +373,7 @@ function doExport(cp, mode) {
   )) return;
 
   downloadJson(safeFilename(cp.title), toShareable(cp, mode));
-  setStatus(`${mode === "compact" ? "Compact handoff" : "Full checkpoint"} exported.`);
+  setStatus("Checkpoint exported.");
 }
 
 async function doImport(input) {

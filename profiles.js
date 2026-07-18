@@ -62,13 +62,13 @@ Engineering profile additions:
 - Keep artifacts as contiguous verbatim quotations. Never assemble a synthetic "final file" from multiple turns; engineeringState may describe files, but artifacts remain source-faithful quotations.`;
 
 export const PROFILE_OPTIONS = [
-  { id: "general", label: "Business / General" },
+  { id: "general", label: "General" },
   { id: "engineering", label: "Engineering / SWE" },
 ];
 
 export function resolveProfile(id, base) {
   if (id !== "engineering") {
-    return { id: "general", label: "Business / General", ...base };
+    return { id: "general", label: "General", ...base };
   }
 
   const properties = {
