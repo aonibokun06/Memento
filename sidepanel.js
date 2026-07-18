@@ -7,7 +7,10 @@ import {
   saveSettings,
   formatRestorePrompt,
   setPendingRestore,
+  toShareable,
+  importCheckpoint,
 } from "./storage.js";
+import { analyzeCheckpointHealth } from "./health.js";
 
 const statusEl = document.getElementById("status");
 const viewEl = document.getElementById("view");
@@ -15,6 +18,7 @@ const viewEl = document.getElementById("view");
 let currentView = "checkpoints";
 let scraped = null; // last scan result, held in memory only
 let extracted = null; // last extraction result, held in memory only
+let captureProfile = "general";
 let selectedId = null; // checkpoint open in the detail view
 
 function setStatus(text = "", isError = false) {
@@ -33,6 +37,16 @@ function el(tag, props = {}, ...children) {
 async function renderCheckpoints() {
   const checkpoints = await listCheckpoints();
   viewEl.replaceChildren();
+
+  const importInput = el("input", {
+    type: "file",
+    accept: ".json,.checkpoint.json,application/json",
+  });
+  importInput.style.display = "none";
+  importInput.addEventListener("change", () => doImport(importInput));
+  const importButton = el("button", { textContent: "Import checkpoint" });
+  importButton.addEventListener("click", () => importInput.click());
+  viewEl.append(el("div", { className: "share-toolbar" }, importButton, importInput));
 
   if (checkpoints.length === 0) {
     viewEl.append(
@@ -97,13 +111,46 @@ async function renderDetail() {
     show("checkpoints");
   });
 
-  for (const b of [restore, copy, del]) b.style.marginRight = "6px";
-  viewEl.append(back, el("div", {}, restore, copy, del));
-  if (cp.state) viewEl.append(renderState(cp.state));
+  const exportFull = el("button", { textContent: "Export full" });
+  exportFull.addEventListener("click", () => doExport(cp, "full"));
+  const exportCompact = el("button", { textContent: "Export compact" });
+  exportCompact.addEventListener("click", () => doExport(cp, "compact"));
+
+  for (const b of [restore, copy, exportFull, exportCompact, del]) b.style.marginRight = "6px";
+  viewEl.append(
+    back,
+    el("div", { className: "detail-actions" }, restore, copy, exportFull, exportCompact, del)
+  );
+  viewEl.append(el("div", {
+    className: "profile-badge",
+    textContent: cp.profile === "engineering" ? "Engineering profile" : "Business / General profile",
+  }));
+  viewEl.append(renderHealth(cp));
+  if (cp.state) viewEl.append(renderState(cp.state, cp.profile));
 }
 
 async function renderCapture() {
   viewEl.replaceChildren();
+
+  const profile = el("select");
+  profile.append(
+    el("option", { value: "general", textContent: "Business / General" }),
+    el("option", { value: "engineering", textContent: "Engineering / SWE" })
+  );
+  profile.value = captureProfile;
+  profile.addEventListener("change", () => {
+    captureProfile = profile.value;
+    extracted = null;
+    setStatus("Profile changed. Extract again to apply it.");
+    renderCapture();
+  });
+  const profileHint = el("div", {
+    className: "profile-description",
+    textContent: captureProfile === "engineering"
+      ? "Includes the general checkpoint plus files, commands, work status, blockers, tests, and next actions."
+      : "Captures goals, decisions, constraints, questions, artifacts, and evidence for any kind of conversation.",
+  });
+  viewEl.append(el("label", { textContent: "Checkpoint profile" }), profile, profileHint);
 
   const scan = el(
     "button",
@@ -125,7 +172,8 @@ async function renderCapture() {
     save.style.marginLeft = "6px";
     save.addEventListener("click", doSave);
     viewEl.append(save);
-    viewEl.append(renderState(extracted));
+    viewEl.append(renderHealth({ state: extracted, verification: null }));
+    viewEl.append(renderState(extracted, captureProfile));
     return;
   }
 
@@ -141,8 +189,33 @@ async function renderCapture() {
   }
 }
 
+function renderHealth(checkpoint) {
+  const report = analyzeCheckpointHealth(checkpoint);
+  const card = el("section", { className: `health health-${report.status}` });
+  card.append(
+    el("div", { className: "health-title", textContent: `Health: ${report.status.toUpperCase()}` }),
+    el("div", {
+      className: "meta",
+      textContent: `${report.counts.passed} passed · ${report.counts.warnings} warnings · ${report.counts.blockers} blockers`,
+    })
+  );
+
+  for (const finding of report.findings) {
+    const icon = { pass: "✓", warning: "⚠", error: "✕" }[finding.severity];
+    card.append(
+      el(
+        "div",
+        { className: `health-finding ${finding.severity}` },
+        el("div", { className: "title", textContent: `${icon} ${finding.label}` }),
+        el("div", { className: "meta", textContent: finding.detail })
+      )
+    );
+  }
+  return card;
+}
+
 /** Render an extracted checkpoint as readable sections, not raw JSON. */
-function renderState(state) {
+function renderState(state, profile = "general") {
   const frag = document.createDocumentFragment();
 
   const section = (heading, body) => {
@@ -170,6 +243,25 @@ function renderState(state) {
   section("Artifacts", lines(state.artifacts, (a) =>
     `${a.name} (${a.kind})\n${a.content}`));
   section("Glossary", lines(state.glossary, (g) => `${g.term}: ${g.meaning}`));
+
+  const eng = state.engineeringState;
+  if (profile === "engineering" || (eng && [eng.branch, ...(eng.completed ?? []), ...(eng.inProgress ?? []),
+    ...(eng.blocked ?? []), ...(eng.files ?? []), ...(eng.commands ?? []),
+    ...(eng.knownIssues ?? []), ...(eng.nextActions ?? []), ...(eng.definitionOfDone ?? [])].some(Boolean))) {
+    const engineeringLines = [];
+    if (!eng) engineeringLines.push("No engineering state was extracted.");
+    if (eng?.branch) engineeringLines.push(`Branch: ${eng.branch}`);
+    if (eng?.completed?.length) engineeringLines.push(`Completed:\n${eng.completed.map((x) => `✓ ${x}`).join("\n")}`);
+    if (eng?.inProgress?.length) engineeringLines.push(`In progress:\n${eng.inProgress.map((x) => `• ${x}`).join("\n")}`);
+    if (eng?.blocked?.length) engineeringLines.push(`Blocked:\n${eng.blocked.map((x) => `! ${x}`).join("\n")}`);
+    if (eng?.files?.length) engineeringLines.push(`Files:\n${eng.files.map((f) => `• ${f.path} — ${f.status}: ${f.purpose}`).join("\n")}`);
+    if (eng?.commands?.length) engineeringLines.push(`Commands:\n${eng.commands.map((c) => `• ${c.command} — ${c.result}`).join("\n")}`);
+    if (eng?.knownIssues?.length) engineeringLines.push(`Known issues:\n${eng.knownIssues.map((x) => `• ${x}`).join("\n")}`);
+    if (eng?.nextActions?.length) engineeringLines.push(`Next actions:\n${eng.nextActions.map((x) => `• ${x}`).join("\n")}`);
+    if (eng?.definitionOfDone?.length) engineeringLines.push(`Definition of done:\n${eng.definitionOfDone.map((x) => `• ${x}`).join("\n")}`);
+    if (eng && engineeringLines.length === 0) engineeringLines.push("No explicit SWE work state was found in this conversation.");
+    section("Engineering handoff", el("div", { className: "text", textContent: engineeringLines.join("\n\n") }));
+  }
 
   return frag;
 }
@@ -235,6 +327,64 @@ function show(view) {
 
 // ---------------------------------------------------------------- actions
 
+function safeFilename(title) {
+  const base = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 60) || "checkpoint";
+  return `${base}.checkpoint.json`;
+}
+
+function downloadJson(filename, value) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = el("a", { href: url, download: filename });
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function doExport(cp, mode) {
+  const report = analyzeCheckpointHealth(cp);
+  const hasSecret = report.findings.some(
+    (finding) => finding.category === "Security" && finding.severity === "error"
+  );
+  if (hasSecret) {
+    return setStatus("Export blocked: remove or redact the detected secret first.", true);
+  }
+  if (report.status === "blocked" && !window.confirm(
+    "This checkpoint has blocking health issues. Export it anyway?"
+  )) return;
+
+  const payload = toShareable(cp, mode);
+  downloadJson(safeFilename(cp.title), payload);
+  setStatus(`${mode === "compact" ? "Compact handoff" : "Full checkpoint"} exported.`);
+}
+
+async function doImport(input) {
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  if (file.size > 10 * 1024 * 1024) {
+    return setStatus("Import failed: checkpoint files must be smaller than 10 MB.", true);
+  }
+
+  setStatus("Importing checkpoint…");
+  try {
+    const parsed = JSON.parse(await file.text());
+    const imported = await importCheckpoint(parsed);
+    selectedId = imported.id;
+    setStatus("Checkpoint imported. Health was recomputed from its contents.");
+    show("detail");
+  } catch (error) {
+    setStatus(`Import failed: ${error.message}`, true);
+  }
+}
+
 async function doScan() {
   setStatus("Scanning… (the page will scroll — that's how it reaches messages Chrome unloaded)");
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -267,6 +417,7 @@ async function doExtract() {
   const res = await chrome.runtime.sendMessage({
     type: "EXTRACT",
     messages: scraped.messages,
+    profile: captureProfile,
   });
 
   if (!res?.ok) return setStatus(res?.error ?? "Extraction failed.", true);
@@ -311,6 +462,7 @@ async function doSave() {
     sourceUrl: scraped.sourceUrl,
     messageCount: scraped.messages.length,
     state: extracted,
+    profile: captureProfile,
   });
   setStatus("Checkpoint saved.");
   extracted = null;

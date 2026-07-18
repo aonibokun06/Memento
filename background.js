@@ -24,6 +24,7 @@ const CHECKPOINT_SCHEMA = {
     "openQuestions",
     "artifacts",
     "glossary",
+    "engineeringState",
   ],
   properties: {
     title: {
@@ -96,6 +97,37 @@ const CHECKPOINT_SCHEMA = {
         },
       },
     },
+    engineeringState: {
+      type: "object",
+      description: "SWE work state. Return empty values for the business/general profile.",
+      additionalProperties: false,
+      required: ["branch", "completed", "inProgress", "blocked", "files", "commands", "knownIssues", "nextActions", "definitionOfDone"],
+      properties: {
+        branch: { type: "string" },
+        completed: { type: "array", items: { type: "string" } },
+        inProgress: { type: "array", items: { type: "string" } },
+        blocked: { type: "array", items: { type: "string" } },
+        files: {
+          type: "array",
+          items: {
+            type: "object", additionalProperties: false,
+            required: ["path", "status", "purpose"],
+            properties: { path: { type: "string" }, status: { type: "string" }, purpose: { type: "string" } },
+          },
+        },
+        commands: {
+          type: "array",
+          items: {
+            type: "object", additionalProperties: false,
+            required: ["command", "result"],
+            properties: { command: { type: "string" }, result: { type: "string" } },
+          },
+        },
+        knownIssues: { type: "array", items: { type: "string" } },
+        nextActions: { type: "array", items: { type: "string" } },
+        definitionOfDone: { type: "array", items: { type: "string" } },
+      },
+    },
   },
 };
 
@@ -116,7 +148,7 @@ function formatTranscript(messages) {
     .join("\n\n");
 }
 
-async function extract(messages) {
+async function callStructured({ model, system, user, schema, schemaName }) {
   const { openaiKey } = await getSettings();
   if (!openaiKey) {
     return { ok: false, error: "No OpenAI key set. Add one in Settings." };
@@ -131,20 +163,17 @@ async function extract(messages) {
         Authorization: `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: EXTRACT_MODEL,
+        model,
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: `Extract resumable state from this conversation:\n\n${formatTranscript(messages)}`,
-          },
+          { role: "system", content: system },
+          { role: "user", content: user },
         ],
         response_format: {
           type: "json_schema",
           json_schema: {
-            name: "checkpoint",
+            name: schemaName,
             strict: true,
-            schema: CHECKPOINT_SCHEMA,
+            schema,
           },
         },
       }),
@@ -188,9 +217,22 @@ async function extract(messages) {
   }
 }
 
+async function extract(messages, profile = "general") {
+  const profileInstruction = profile === "engineering"
+    ? "This is an Engineering profile. Populate engineeringState only from explicit transcript evidence. Never invent branches, files, commands, test results, or completion state."
+    : "This is a Business/General profile. Keep engineeringState empty and focus on universal conversation state.";
+  return callStructured({
+    model: EXTRACT_MODEL,
+    system: SYSTEM_PROMPT,
+    user: `${profileInstruction}\n\nExtract resumable state from this conversation:\n\n${formatTranscript(messages)}`,
+    schema: CHECKPOINT_SCHEMA,
+    schemaName: "checkpoint",
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "EXTRACT") {
-    extract(msg.messages).then(sendResponse, (e) =>
+    extract(msg.messages, msg.profile).then(sendResponse, (e) =>
       sendResponse({ ok: false, error: e.message })
     );
     return true; // keep the channel open for the async response
